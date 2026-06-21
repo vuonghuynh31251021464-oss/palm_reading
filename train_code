@@ -1,0 +1,246 @@
+!pip install -q tensorflow pandas scikit-learn
+
+from google.colab import drive
+drive.mount('/content/drive')
+
+RAW_IMAGES_DIR = "/content/drive/MyDrive/AI_Processed_Pics"
+CSV_PATH       = "/content/drive/MyDrive/AI_Processed_Pics/FINAL CSV/label_chitay_final.csv"
+MODEL_OUT_DIR  = "/content/drive/MyDrive/palm_project/model_multioutput"
+
+IMG_SIZE = 224
+BATCH_SIZE = 32
+EPOCHS_HEAD = 15
+EPOCHS_FINETUNE = 10
+VAL_SPLIT = 0.15
+TEST_SPLIT = 0.15
+RANDOM_SEED = 42
+
+import os
+os.makedirs(MODEL_OUT_DIR, exist_ok=True)
+
+import numpy as np
+import pandas as pd
+import cv2
+import tensorflow as tf
+from tensorflow.keras import layers, Model
+from sklearn.model_selection import train_test_split
+import matplotlib.pyplot as plt
+
+tf.random.set_seed(RANDOM_SEED)
+np.random.seed(RANDOM_SEED)
+
+REGIONS = ["sinh_dao", "tam_dao", "tri_dao", "su_nghiep"]
+COLUMN_MAP = {
+    "sinh_dao": "sinhdao",
+    "tam_dao": "tamdao",
+    "tri_dao": "tridao",
+    "su_nghiep": "sunghiep",
+}
+CLASSES = ["ngan", "trung_binh", "dai"]
+
+df = pd.read_csv(CSV_PATH)
+print(f"Tổng số dòng trong CSV: {len(df)}")
+
+exists_mask = df["name"].apply(lambda n: os.path.exists(os.path.join(RAW_IMAGES_DIR, n)))
+missing_count = (~exists_mask).sum()
+if missing_count > 0:
+    print(f"⚠️ {missing_count} ảnh trong CSV không tìm thấy file thật, sẽ bị loại bỏ.")
+df = df[exists_mask].reset_index(drop=True)
+print(f"Số ảnh dùng được: {len(df)}")
+
+thresholds = {}
+for region, col in COLUMN_MAP.items():
+    q33 = df[col].quantile(1/3)
+    q66 = df[col].quantile(2/3)
+    thresholds[region] = (q33, q66)
+    print(f"{region} ({col}): ngắn <= {q33:.2f} < trung_binh < {q66:.2f} <= dài")
+
+def score_to_class_idx(score, region):
+    q33, q66 = thresholds[region]
+    if score <= q33:
+        return 0
+    elif score < q66:
+        return 1
+    else:
+        return 2
+
+train_df, temp_df = train_test_split(df, test_size=(VAL_SPLIT + TEST_SPLIT),
+                                     random_state=RANDOM_SEED)
+val_df, test_df = train_test_split(
+    temp_df, test_size=TEST_SPLIT / (VAL_SPLIT + TEST_SPLIT), random_state=RANDOM_SEED
+)
+print(f"Train: {len(train_df)} | Validation: {len(val_df)} | Test: {len(test_df)}")
+
+class PalmDataGenerator(tf.keras.utils.Sequence):
+    def __init__(self, dataframe, images_dir, batch_size=32, img_size=224,
+                 augment=False, shuffle=True, **kwargs):
+        super().__init__(**kwargs)
+        self.df = dataframe.reset_index(drop=True)
+        self.images_dir = images_dir
+        self.batch_size = batch_size
+        self.img_size = img_size
+        self.augment = augment
+        self.shuffle = shuffle
+        self.indices = np.arange(len(self.df))
+        if self.shuffle:
+            np.random.shuffle(self.indices)
+
+    def __len__(self):
+        return int(np.ceil(len(self.df) / self.batch_size))
+
+    def on_epoch_end(self):
+        if self.shuffle:
+            np.random.shuffle(self.indices)
+
+    def _augment_image(self, img):
+        if np.random.rand() < 0.5:
+            img = cv2.flip(img, 1)
+        if np.random.rand() < 0.3:
+            angle = np.random.uniform(-15, 15)
+            h, w = img.shape[:2]
+            M = cv2.getRotationMatrix2D((w//2, h//2), angle, 1.0)
+            img = cv2.warpAffine(img, M, (w, h), borderMode=cv2.BORDER_REFLECT)
+        if np.random.rand() < 0.3:
+            factor = np.random.uniform(0.8, 1.2)
+            img = np.clip(img * factor, 0, 255).astype(np.uint8)
+        return img
+
+    def __getitem__(self, idx):
+        batch_indices = self.indices[idx*self.batch_size:(idx+1)*self.batch_size]
+        batch_df = self.df.iloc[batch_indices]
+
+        imgs = []
+        labels = {region: [] for region in REGIONS}
+
+        for _, row in batch_df.iterrows():
+            img_path = os.path.join(self.images_dir, row["name"])
+            img = cv2.imread(img_path)
+            img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+            img = cv2.resize(img, (self.img_size, self.img_size))
+            if self.augment:
+                img = self._augment_image(img)
+            img = img.astype(np.float32) / 255.0
+            imgs.append(img)
+
+            for region in REGIONS:
+                score = row[COLUMN_MAP[region]]
+                class_idx = score_to_class_idx(score, region)
+                onehot = np.zeros(3, dtype=np.float32)
+                onehot[class_idx] = 1.0
+                labels[region].append(onehot)
+
+        X = np.array(imgs, dtype=np.float32)
+        Y = {region: np.array(labels[region], dtype=np.float32) for region in REGIONS}
+        return X, Y
+
+train_gen = PalmDataGenerator(train_df, RAW_IMAGES_DIR, batch_size=BATCH_SIZE,
+                              img_size=IMG_SIZE, augment=True, shuffle=True)
+val_gen   = PalmDataGenerator(val_df, RAW_IMAGES_DIR, batch_size=BATCH_SIZE,
+                              img_size=IMG_SIZE, augment=False, shuffle=False)
+test_gen  = PalmDataGenerator(test_df, RAW_IMAGES_DIR, batch_size=BATCH_SIZE,
+                              img_size=IMG_SIZE, augment=False, shuffle=False)
+
+X_check, Y_check = train_gen[0]
+print(f"\nKiểm tra batch đầu tiên: X shape={X_check.shape}")
+for region in REGIONS:
+    print(f"  {region}: Y shape={Y_check[region].shape}")
+
+base_model = tf.keras.applications.MobileNetV2(
+    input_shape=(IMG_SIZE, IMG_SIZE, 3),
+    include_top=False,
+    weights="imagenet",
+)
+base_model.trainable = False
+
+inputs = layers.Input(shape=(IMG_SIZE, IMG_SIZE, 3))
+x = base_model(inputs, training=False)
+x = layers.GlobalAveragePooling2D()(x)
+x = layers.Dropout(0.3)(x)
+x = layers.Dense(256, activation="relu")(x)
+x = layers.BatchNormalization()(x)
+x = layers.Dropout(0.3)(x)
+
+outputs = {}
+for region in REGIONS:
+    outputs[region] = layers.Dense(3, activation="softmax", name=region)(x)
+
+model = Model(inputs=inputs, outputs=outputs)
+
+model.compile(
+    optimizer=tf.keras.optimizers.Adam(learning_rate=1e-4),
+    loss={region: "categorical_crossentropy" for region in REGIONS},
+    metrics={region: "accuracy" for region in REGIONS},
+)
+
+model.summary()
+
+callbacks = [
+    tf.keras.callbacks.EarlyStopping(
+        monitor="val_loss", patience=5, restore_best_weights=True
+    ),
+    tf.keras.callbacks.ReduceLROnPlateau(
+        monitor="val_loss", factor=0.5, patience=3, min_lr=1e-7
+    ),
+]
+
+history_head = model.fit(
+    train_gen,
+    validation_data=val_gen,
+    epochs=EPOCHS_HEAD,
+    callbacks=callbacks,
+)
+
+base_model.trainable = True
+fine_tune_at = len(base_model.layers) - 30
+for layer in base_model.layers[:fine_tune_at]:
+    layer.trainable = False
+
+model.compile(
+    optimizer=tf.keras.optimizers.Adam(learning_rate=1e-5),
+    loss={region: "categorical_crossentropy" for region in REGIONS},
+    metrics={region: "accuracy" for region in REGIONS},
+)
+
+history_finetune = model.fit(
+    train_gen,
+    validation_data=val_gen,
+    epochs=EPOCHS_FINETUNE,
+    callbacks=callbacks,
+)
+
+print("\n📊 Đánh giá trên tập test:")
+test_results = model.evaluate(test_gen, return_dict=True)
+for k, v in test_results.items():
+    print(f"  {k}: {v:.4f}")
+
+model_path = os.path.join(MODEL_OUT_DIR, "palm_multioutput_model.keras")
+model.save(model_path)
+print(f"\n✅ Model đã lưu tại: {model_path}")
+
+import json
+threshold_path = os.path.join(MODEL_OUT_DIR, "thresholds.json")
+with open(threshold_path, "w") as f:
+    json.dump({k: list(v) for k, v in thresholds.items()}, f, indent=2)
+print(f"✅ Ngưỡng tertile đã lưu tại: {threshold_path}")
+
+fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+
+all_loss = history_head.history["loss"] + history_finetune.history["loss"]
+all_val_loss = history_head.history["val_loss"] + history_finetune.history["val_loss"]
+axes[0].plot(all_loss, label="train_loss")
+axes[0].plot(all_val_loss, label="val_loss")
+axes[0].axvline(x=EPOCHS_HEAD, color="gray", linestyle="--", label="bắt đầu fine-tune")
+axes[0].set_title("Loss theo epoch")
+axes[0].legend()
+
+for region in REGIONS:
+    acc_key = f"{region}_accuracy"
+    if acc_key in history_head.history:
+        combined = history_head.history[acc_key] + history_finetune.history[acc_key]
+        axes[1].plot(combined, label=region)
+axes[1].set_title("Accuracy từng vùng theo epoch")
+axes[1].legend()
+
+plt.tight_layout()
+plt.savefig(os.path.join(MODEL_OUT_DIR, "training_curves.png"))
+plt.show()
